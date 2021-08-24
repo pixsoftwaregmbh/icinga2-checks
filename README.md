@@ -1,11 +1,11 @@
-#Collection of Icinga2/Nagios checks
+# Collection of Icinga2/Nagios checks
 
-##Intro
+## Intro
 This repo contains checks that we have written for our Icinga2 monitoring system. These should also be compatible with Nagios.
 
-##Important note
+## Important note
 This checks were written and tested on our setup. Might not work for everyone.
 The work is of limited scope. Fell free to use it tho. If you would like to add new features submit a pull request or fork the repo.
 
-##Documentation
+## Documentation
 Each check should have a doc ending with .md inside the docs folder.
