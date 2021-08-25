@@ -17,19 +17,15 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
-#Parameter:
-#InfluxDB
-#-h host
-#-b bucket
-#-o org
-#-m measurement
-#-f fields
-#-t tag
-#-p time period
-#-a aggregate function
-#
-#-w warning
-#-c critical
+# Version 0.0.1 - Aug/2021
+# Initial creation.
+# by Sergej Kurtin - operating@pixsoftware.de
+
+# Version 0.0.2 - Aug/2021
+# Changes:
+#  - transformed field argument into array to hold multiple values
+#  - added threshold function on how to make decision when multiple fileds are provided
+#  - added diff argument to calc difference for counter values inside query
 
 use warnings;
 use strict;
@@ -47,20 +43,24 @@ use Number::Bytes::Human qw(format_bytes);
 
 use constant STATUS  => qw(OK WARNING CRITICAL UNKNOWN);
 my @status=(STATUS);
-my $VERSION="version 0.0.1";
+my $VERSION="version 0.0.2";
 
+# disabling buffering, we are printing the output in parts
 local $| = 1;
 
+###
+# parsing arguments
+#
 my ($opt, $usage)=describe_options(
     '%c %o',
     #reserved nagios arguments
     ["version|V"		,"Prints the version of this script.",	{ shortcircuit => 1 }],	  
     ["help|h"			,"Prints the help message.",		{ shortcircuit => 1 }],
     ["usage|?"			,"Prints a short usage message.",	{ shortcircuit => 1 }],
-    [],
+    []				,
     ["timeout|t=i"		,"Specify script timeout."],
     ["host|H=s"			,"Specify the host."],
-    ["verbose|v+"		,"Set output verbosity.",		{ default => 0 }],
+    ["verbose|v+"		,"Set output verbosity.",		{ default      => 0 }],
     ["warning|w=f"		,"Set warning threshold."],
     ["critical|c=f"		,"Set critical threshold."],
     [],
@@ -68,10 +68,15 @@ my ($opt, $usage)=describe_options(
     ["bucket|b|d|database=s"	,"Set the InfluxDB database/bucket."],
     ["org|o|organization=s"	,"Set the organization."],
     ["measurement|m=s"		,"Specify the measurement."],
-    ["field|f=s"		,"Specify the field."],
+    ["field|f=s@"		,"Specify the field."],
+    ["fieldcon=s"		,"Specify by which function the fields are connected."],
     ["tag|T=s%"			,"Specify additional tags as key=value pairs. Can be provided multiple times."],
     ["period|p=s"		,"The time period over which the data is checked."],
-    ["aggregate|a=s"		,"The aggregate function. The aggregate time is the same as period."]
+    ["aggregate|a=s"		,"The aggregate function. The aggregate time is the same as period."],
+    ["thresfun=s"		,"Threshold function how separate values are compared against the thresholds."],
+    ["diff"                     ,"Calculate difference before processing, usefull for counter values like diskio."],
+    ["token=s"                  ,"InfluxDB API token."],
+    ["bytes"                    ,"Format output as human readyble byte value."]
     );
 ###
 # print help message and exit
@@ -84,23 +89,48 @@ if ($opt->help){
 $opt->verbose=3 if ($opt->verbose>3);
 my $exit_status=0;
 
-# the ? has to be added because the library does not
+sub max {
+    ($a, $b)=@_;
+    return $a if ($a >= $b);
+    return $b;
+}
+
+sub check_threshold {
+    my ($value)=@_;
+    $exit_status=max(1, $exit_status) if sprintf("%.2f", $value) > sprintf("%.2f", $opt->warning);
+    $exit_status=max(2, $exit_status) if sprintf("%.2f", $value) > sprintf("%.2f", $opt->critical);
+    return;
+}
+
+sub format_result {
+    my (@values)=@_;
+    return join(",", map {"@{${_}}[0]=${\(format_bytes(@{${_}}[1]))}"} @values) if $opt->{bytes};
+    return join(",", map {"@{${_}}[0]=@{${_}}[1]"} @values);
+}
+
+# the ? has to be appended because the library does not
 my $url	    = "http://127.0.0.1:8086/api/v2/query?";
-my %headers =("Authorization" => "Token <token>",
-	     "Accept"	      => "application/csv",
-	     "Content-Type"   => "application/vnd.flux" );
+my %headers = ("Authorization"	=> "Token ${\$opt->{token}}",
+	       "Accept"		=> "application/csv",
+	       "Content-Type"	=> "application/vnd.flux");
 my %urlparams=( org => $opt->org );
+# if field-con is not set this still works but gives a warning
+# for now we let this just be
+my $fields=join($opt->{fieldcon}, map {" r[\"_field\"] == \"$_\" "} @{$opt->{field}});
 my $query    =qq(from(bucket:"$opt->{bucket}")
 |> range(start: -$opt->{period})
 |> filter(fn: (r) => r["_measurement"] == "$opt->{measurement}")
-|> filter(fn: (r) => r["_field"] == "$opt->{field}")
+|> filter(fn: (r) => $fields)
 );
 foreach my $key ( keys %{$opt->tag}){
     $query .=qq(|> filter(fn: (r) => r["$key"] == "$opt->{tag}{$key}")\n);
 }
 $query.=qq(|> filter(fn: (r) => r["host"] == "$opt->{host}")
-|> aggregateWindow(every: $opt->{period}, fn: $opt->{aggregate}));
-#say STDERR $query;
+);
+$query.=qq(|> difference(nonNegative: false, columns: ["_value"])
+) if ($opt->{diff});
+$query.=qq(|> aggregateWindow(every: $opt->{period}, fn: $opt->{aggregate}));
+say STDERR $query;
 
 my $http	 =  HTTP::Tiny->new();
 my $params	 =  $http->www_form_urlencode( \%urlparams );
@@ -108,24 +138,88 @@ my $query_result =  $http->post($url.$params, {
     content	 => $query,
     headers	 => \%headers}
     );
-# eg: CPU_USAGE_SYSTEM__
-print uc($opt->measurement."_".$opt->field)."_";
-# eg: CPU_CPU_TOTAL_
-print map {uc($_) . "_"} %{$opt->tag};
+say STDERR $query_result->{content};
+###
+# $opt->measurement + "_" + array $opt->field unrolled + "_" + hash $opt->tag as key_value
+# eg: CPU + USAGE_SYSTEM + CPU +  CPU_TOTAL
+#
+print uc(join("_", $opt->measurement, @{ $opt->field}, map {"${_}_$opt->{tag}{$_}"} keys %{$opt->tag}));
+
 my $result;
+###
+# API call was not successfull
+#
 if (! $query_result->{success}){
     $exit_status=3;
-    $result=$query_result->{content};   
-} elsif ((! length $query_result->{content})
-	 or ($query_result->{content} =~ /^\s*$/)
-    ){
+    $result=$query_result->{content};}
+###
+# API call returned no values eg. because the field/tag do not exist
+#
+elsif ((! length $query_result->{content})
+	 or ($query_result->{content} =~ /^\s*$/))
+{
     $exit_status=3;
-    $result="Received empty answer! This happens when the query does not match any data.";
-} elsif ($query_result->{success}){
+    $result="Received empty answer! This happens when the query does not match any data.";}
+###
+# Successfull API call
+#
+elsif ($query_result->{success}){
+    # because each line start with "," the first element is empty
+    # to use a hash we would need to remove the "," from the beginning for each line
+    # or we use an array, then the first element is undef
     my $aoa = csv (in => \$query_result->{content});
-    $result=$aoa->[1][6];
-    $exit_status=1 if sprintf("%.2f", $result) > sprintf("%.2f", $opt->warning);
-    $exit_status=2 if sprintf("%.2f", $result) > sprintf("%.2f", $opt->critical);
+
+    ###
+    # the positions are sometimes not stable, therefor we have to search for them
+    #
+    my ($value_index, $field_index, $stop_index, $time_index);
+    for my $i (0 .. scalar @{$aoa->[0]}){
+	next if ! (defined $aoa->[0][$i]);
+	if    ($aoa->[0][$i] eq "_value"){		
+	       $value_index=$i;			
+	}					
+	elsif ($aoa->[0][$i] eq "_field"){	
+	       $field_index=$i;			
+	}					
+	elsif ($aoa->[0][$i] eq "_stop"){	
+	       $stop_index=$i;			
+	}					
+	elsif ($aoa->[0][$i] eq "_time"){	
+	       $time_index=$i;		
+	}
+    }
+    ###
+    # checking only one value
+    #
+    if (scalar(@$aoa) <= 3){
+	$result=$aoa->[1][$value_index];
+	check_threshold($result);}
+    ###
+    # checking multiple values
+    #
+    else {
+	my @result_values;
+	for my $line (@$aoa){
+	    # in case there is an empty line that was inserted as an element
+	    next if (scalar(@$line) < 2);
+	    # lines with actual values start with ",_result"
+	    if ($$line[1] eq "_result"
+		and $$line[$stop_index] eq $$line[$time_index]){
+		push @result_values, [$$line[$field_index], $$line[$value_index]];
+	    }
+	}
+	# the values have to be sumed up for comparison
+	if (defined $opt->{thresfun}
+	    and $opt->{thresfun} eq "sum")
+	{
+	    my $value_sum += @$_[1] for @result_values;
+	    check_threshold($value_sum);
+	    $result=format_result(@result_values);}
+	else {
+	    check_threshold(@$_[1]) for @result_values;
+	    $result=format_result(@result_values);
+	}
+    }
 }
 print " $status[$exit_status]: ";
 print $result;
