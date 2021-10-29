@@ -24,8 +24,10 @@
 # Version 0.0.2 - Aug/2021
 # Changes:
 #  - transformed field argument into array to hold multiple values
-#  - added threshold function on how to make decision when multiple fileds are provided
+#  - added threshold function on how to make decision when multiple fields are provided
 #  - added diff argument to calc difference for counter values inside query
+#  - added bytes argument for output formating
+#  - check can now handle multiple values
 
 use warnings;
 use strict;
@@ -54,39 +56,42 @@ local $| = 1;
 my ($opt, $usage)=describe_options(
     '%c %o',
     #reserved nagios arguments
-    ["version|V"		,"Prints the version of this script.",	{ shortcircuit => 1 }],	  
-    ["help|h"			,"Prints the help message.",		{ shortcircuit => 1 }],
-    ["usage|?"			,"Prints a short usage message.",	{ shortcircuit => 1 }],
+    ["version|V"		,"Prints the version of this script.",			{ shortcircuit => 1 }],	  
+    ["help|h"			,"Prints the help message.",				{ shortcircuit => 1 }],
+    ["usage|?"			,"Prints a short usage message.",			{ shortcircuit => 1 }],
     []				,
     ["timeout|t=i"		,"Specify script timeout."],
-    ["host|H=s"			,"Specify the host."],
-    ["verbose|v+"		,"Set output verbosity.",		{ default      => 0 }],
-    ["warning|w=f"		,"Set warning threshold."],
-    ["critical|c=f"		,"Set critical threshold."],
+    ["host|H=s"			,"Specify the host.",					{ required => 1 }],
+    ["verbose|v+"		,"Set output verbosity.",				{ default  => 0 }],
+    ["warning|w=f"		,"Set warning threshold.",				{ required => 1 }],
+    ["critical|c=f"		,"Set critical threshold.",				{ required => 1 }],
     [],
     #our own arguments
-    ["bucket|b|d|database=s"	,"Set the InfluxDB database/bucket."],
-    ["org|o|organization=s"	,"Set the organization."],
-    ["measurement|m=s"		,"Specify the measurement."],
-    ["field|f=s@"		,"Specify the field."],
+    ["url=s"                    ,"Set the InfluxDB URL, default: http://127.0.0.1:8086",{ default => "http://127.0.0.1:8086" }],
+    ["bucket|b|d|database=s"	,"Set the InfluxDB database/bucket.",			{ required => 1 }],
+    ["org|o|organization=s"	,"Set the organization.",				{ required => 1 }],
+    ["measurement|m=s"		,"Specify the measurement.",				{ required => 1 }],
+    ["field|f=s@"		,"Specify the field.",					{ required => 1 }],
     ["fieldcon=s"		,"Specify by which function the fields are connected."],
     ["tag|T=s%"			,"Specify additional tags as key=value pairs. Can be provided multiple times."],
-    ["period|p=s"		,"The time period over which the data is checked."],
+    ["period|p=s"		,"The time period over which the data is checked.",	{ required => 1 }],
     ["aggregate|a=s"		,"The aggregate function. The aggregate time is the same as period."],
     ["thresfun=s"		,"Threshold function how separate values are compared against the thresholds."],
     ["diff"                     ,"Calculate difference before processing, usefull for counter values like diskio."],
-    ["token=s"                  ,"InfluxDB API token."],
-    ["bytes"                    ,"Format output as human readyble byte value."]
+    ["token=s"                  ,"InfluxDB API token.",					{ required => 1 }],
+    ["bytes"                    ,"Format output as human readable byte value."],
+    ["debug"                    ,"Enables debug output to STDERR, usefull for running on cli."],
+    ["nofill"                   ,"Disable filling null values with 0."]
     );
 ###
 # print help message and exit
 #
-if ($opt->help){
+if ($opt->help or $opt->usage){
     print($usage->text);
     exit 0;
 }
 #capping verbosity level to 3
-$opt->verbose=3 if ($opt->verbose>3);
+$opt->verbose=3 if ($opt->verbose > 3);
 my $exit_status=0;
 
 sub max {
@@ -109,11 +114,14 @@ sub format_result {
 }
 
 # the ? has to be appended because the library does not
-my $url	    = "http://127.0.0.1:8086/api/v2/query?";
+my $url	    = $opt->{url}."/api/v2/query?";
 my %headers = ("Authorization"	=> "Token ${\$opt->{token}}",
 	       "Accept"		=> "application/csv",
 	       "Content-Type"	=> "application/vnd.flux");
 my %urlparams=( org => $opt->org );
+###
+# assembling the flux query, line by line
+#
 # if field-con is not set this still works but gives a warning
 # for now we let this just be
 my $fields=join($opt->{fieldcon}, map {" r[\"_field\"] == \"$_\" "} @{$opt->{field}});
@@ -121,16 +129,24 @@ my $query    =qq(from(bucket:"$opt->{bucket}")
 |> range(start: -$opt->{period})
 |> filter(fn: (r) => r["_measurement"] == "$opt->{measurement}")
 |> filter(fn: (r) => $fields)
-);
-foreach my $key ( keys %{$opt->tag}){
-    $query .=qq(|> filter(fn: (r) => r["$key"] == "$opt->{tag}{$key}")\n);
+    );
+if ( exists $opt->{tag} ){
+    while ((my $key, my $value) = each (%{$opt->tag})){
+	$query .=qq(|> filter(fn: (r) => r["$key"] == "$opt->{tag}{$key}")\n);
+    }
 }
 $query.=qq(|> filter(fn: (r) => r["host"] == "$opt->{host}")
 );
+###
+# filling empty values with 0
+# script doesnt handle null values
+#
+$query.=qq(|> fill(column:"_value", value: 0)
+) unless $opt->nofill;
 $query.=qq(|> difference(nonNegative: false, columns: ["_value"])
-) if ($opt->{diff});
-$query.=qq(|> aggregateWindow(every: $opt->{period}, fn: $opt->{aggregate}));
-say STDERR $query;
+) if ($opt->diff);
+$query.=qq(|>aggregateWindow(every: $opt->{period}, fn: $opt->{aggregate}));
+say STDERR $query if $opt->debug;
 
 my $http	 =  HTTP::Tiny->new();
 my $params	 =  $http->www_form_urlencode( \%urlparams );
@@ -138,12 +154,23 @@ my $query_result =  $http->post($url.$params, {
     content	 => $query,
     headers	 => \%headers}
     );
-say STDERR $query_result->{content};
+say STDERR $query_result->{content} if $opt->{debug};
 ###
 # $opt->measurement + "_" + array $opt->field unrolled + "_" + hash $opt->tag as key_value
-# eg: CPU + USAGE_SYSTEM + CPU +  CPU_TOTAL
+# eg: CPU + USAGE_SYSTEM + CPU + CPU_TOTAL
 #
-print uc(join("_", $opt->measurement, @{ $opt->field}, map {"${_}_$opt->{tag}{$_}"} keys %{$opt->tag}));
+if (exists $opt->{tag}){
+    print uc(join("_",
+		  $opt->measurement,
+		  @{ $opt->field},
+		  map {"${_}_$opt->{tag}{$_}"} keys %{$opt->tag})
+    );
+} else {
+    print uc(join("_",
+	      $opt->measurement,
+	      @{ $opt->field})
+	);
+}
 
 my $result;
 ###
