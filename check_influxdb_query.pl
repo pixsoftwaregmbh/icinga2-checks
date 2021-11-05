@@ -81,7 +81,8 @@ my ($opt, $usage)=describe_options(
     ["token=s"                  ,"InfluxDB API token.",					{ required => 1 }],
     ["bytes"                    ,"Format output as human readable byte value."],
     ["debug"                    ,"Enables debug output to STDERR, usefull for running on cli."],
-    ["nofill"                   ,"Disable filling null values with 0."]
+    ["nofill"                   ,"Disable filling null values with 0."],
+    ["no-unknown-when-empty"    ,"When no data is returned the status is set to ok."]
     );
 ###
 # print help message and exit
@@ -185,8 +186,14 @@ if (! $query_result->{success}){
 elsif ((! length $query_result->{content})
 	 or ($query_result->{content} =~ /^\s*$/))
 {
-    $exit_status=3;
-    $result="Received empty answer! This happens when the query does not match any data.";}
+    
+    $result="Received empty answer! This happens when the query does not match any data.";
+    if ($opt->no_unknown_when_empty){
+	$exit_status=0;
+    }else{
+	$exit_status=3;
+    }
+}
 ###
 # Successfull API call
 #
